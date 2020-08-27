@@ -1,0 +1,6 @@
+click>=7.0
+dataclasses==0.7
+matplotlib>=3.2.0
+numpy>=1.18.1
+pytest==5.3.5
+tensorflow>=2.2.0
