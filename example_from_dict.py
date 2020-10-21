@@ -81,7 +81,8 @@ def run_simple_experiment():
 
     columns_ordering = ["day_of_week",
                         "hour",
-                        "weather_parameters",
+                        "weather_parameters_1",
+                        "weather_parameters_2",
                         "target_variable",
                         ]
     target_column_name = "target_variable"
@@ -105,7 +106,8 @@ def run_simple_experiment():
         # this dictionary supplements a source dataframe queried for the data.
         data_columns = {
             # observed variables are of given base len
-            "weather_parameters": np.zeros(shape=(base_len, 2)),
+            "weather_parameters_1": np.zeros(shape=(base_len, 1)),
+            "weather_parameters_2": np.zeros(shape=(base_len, 1)),
             # known variables are known also in the future (after the observed variables end)
             "day_of_week": np.zeros(base_len + model_future_horizons),
             "hour": np.zeros(base_len + model_future_horizons),
@@ -134,9 +136,10 @@ def run_simple_experiment():
             "known": np.concatenate([processed_data_per_column["day_of_week"],
                                      processed_data_per_column["hour"],
                                      ], axis=-1),
-            "observed": np.concatenate([processed_data_per_column["weather_parameters"],
+            "observed": np.concatenate([processed_data_per_column["weather_parameters_1"],
+                                        processed_data_per_column["weather_parameters_2"],
                                         processed_data_per_column[target_column_name]
-                                        [:len(processed_data_per_column["weather_parameters"])],
+                                        [:len(processed_data_per_column["weather_parameters_1"])],
                                         # ^ note that the observed target cannot be observed in the future and thats why we cut it
                                         ], axis=-1),
             "static": processed_data_per_column["person_id"]
@@ -165,7 +168,7 @@ def run_simple_experiment():
 
         return ColumnTypes(
             known_inputs=get_cti(["day_of_week", "hour"]),
-            observed_inputs=get_cti(["weather_parameters"]),
+            observed_inputs=get_cti(["weather_parameters_1", "weather_parameters_2"]),
             forecast_inputs=get_cti(["target_variable"]),
             static_inputs=ColumnTypeInfo(["person_id"]),
         )
