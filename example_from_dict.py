@@ -6,7 +6,6 @@ from copy import deepcopy
 import numpy as np
 import tensorflow as tf
 
-from tf_utils import ColumnTypeInfo, ColumnTypes
 from tft_model import TemporalFusionTransformer
 
 physical_devices = tf.config.list_physical_devices("GPU")
@@ -162,28 +161,18 @@ def run_simple_experiment():
     vectorized_input, vectorized_target_predictions = create_data()
     val_vectorized_input, val_vectorized_target_predictions = create_data()
 
-    def input_types():
-        def get_cti(name_list):
-            return ColumnTypeInfo(names=name_list, loc=[columns_ordering.index(name) for name in name_list], )
-
-        return ColumnTypes(
-            known_inputs=get_cti(["day_of_week", "hour"]),
-            observed_inputs=get_cti(["weather_parameters_1", "weather_parameters_2"]),
-            forecast_inputs=get_cti(["target_variable"]),
-            static_inputs=ColumnTypeInfo(["person_id"]),
-        )
-
     tft_model = TemporalFusionTransformer(
         input_shape=[model_seq_len, 2],
         output_shape=[model_future_horizons, 1],
-        column_types=input_types(),
+        n_known=2,  # see the generator
+        n_observed=3,  # see the generator
         future_size=model_future_horizons,
         num_encoder_steps=model_seq_len,
         dropout_rate=0.1,
         hidden_layer_size=5,
         num_heads=4,
         last_activation="linear",
-        static_lookup_size=0,
+        static_lookup_size=12,  # see the generator
     )
     model = tft_model.get_model_vectorized(model_capable_vectorize=True, single_sequence=True)
     model.compile(optimizer="adam", loss="mse")

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple, Union
 
+import numpy as np
 import tensorflow as tf
+from tensorflow.python.keras.engine.keras_tensor import KerasTensor
 
 from tf_utils import (
     get_shape_fixed_if_possible,
@@ -13,7 +15,7 @@ from tf_utils import (
     timedistributed_over_more_batch_dimensions,
     unsquash_batch_dimensions,
     windowing_mechanism,
-    ColumnTypes,
+    s_len, TFTInputNames
 )
 
 logger = logging.getLogger(__name__)
@@ -73,7 +75,7 @@ def linear_layer(size, activation=None, use_time_distributed=False, use_bias=Tru
 
 
 def apply_gating_layer(
-    x, hidden_layer_size: int, dropout_rate: float = None, use_time_distributed: bool = True, activation=None,
+    x, hidden_layer_size: int, dropout_rate: float = None, use_time_distributed: bool = True, activation=None
 ):
     """Applies a Gated Linear Unit (GLU) to an input.
 
@@ -141,13 +143,13 @@ def gated_residual_network(
     hidden = linear_layer(hidden_layer_size, activation=None, use_time_distributed=use_time_distributed)(x)
     if additional_context is not None:
         hidden = hidden + linear_layer(
-            hidden_layer_size, activation=None, use_time_distributed=use_time_distributed, use_bias=False,
+            hidden_layer_size, activation=None, use_time_distributed=use_time_distributed, use_bias=False
         )(additional_context)
     hidden = tf.keras.layers.Activation("elu")(hidden)
     hidden = linear_layer(hidden_layer_size, activation=None, use_time_distributed=use_time_distributed)(hidden)
 
     gating_layer, gate = apply_gating_layer(
-        hidden, output_size, dropout_rate=dropout_rate, use_time_distributed=use_time_distributed, activation=None,
+        hidden, output_size, dropout_rate=dropout_rate, use_time_distributed=use_time_distributed, activation=None
     )
 
     if return_gate:
@@ -156,8 +158,8 @@ def gated_residual_network(
         return add_and_norm([skip, gating_layer])
 
 
-def tempering_batchdot(input_list):
-    d, k = input_list
+def tempering_batchdot(input):
+    d, k = input
     temper = tf.sqrt(tf.cast(k.shape[-1], dtype="float32"))
     return K.batch_dot(d, k, axes=[2, 2]) / temper
 
@@ -195,6 +197,17 @@ class ScaledDotProductAttention(tf.keras.layers.Layer):
         attn = self.dropout(attn)
         output = Lambda(lambda x: K.batch_dot(x[0], x[1]))([attn, v])
         return output, attn
+
+
+def transpose_first_dimensions(x: Union[KerasTensor, tf.Tensor], perm_first: list = [1, 0]):
+    """Transposes first dimensions and leaves the rest be.
+
+    Args:
+        x: Source tensor to transpose.
+        perm_first: Permutation of the first dimensions.
+    """
+    full_permutation = tf.concat([tf.constant(perm_first), tf.range(tf.rank(x))[len(perm_first) :]], axis=0)
+    return tf.transpose(x, full_permutation)
 
 
 class InterpretableMultiHeadAttention(tf.keras.layers.Layer):
@@ -275,206 +288,38 @@ class InterpretableMultiHeadAttention(tf.keras.layers.Layer):
         outputs = self.w_o(outputs)
         outputs = tf.keras.layers.Dropout(self.dropout)(outputs)  # output dropout
 
-        return outputs, attn
+        # Difference to original TFT implementation:
+        #  we need to return batch dimension and then the dimensions created by n_heads.
+        batched_attentions = Lambda(transpose_first_dimensions)(attn)
+        return outputs, batched_attentions
 
 
-class TemporalFusionTransformer:
-    """Defines Temporal Fusion Transformer.
-
-    Attributes:
-        name: Name of model
-        input_shape: Total time steps (i.e. Width of Temporal fusion decoder N) x total number of inputs
-        output_dim: Total number of outputs
-        hidden_layer_size: Internal state size of TFT
-        dropout_rate: Dropout discard rate
-        num_encoder_steps: Size of LSTM encoder -- i.e. number of past time steps before forecast date to use
-        num_heads: Number of heads for interpretable multi-head attention
-    """
-
-    def __init__(
-        self,
-        hidden_layer_size: int,
-        dropout_rate: float,
-        num_heads: int,
-        input_shape: list[int],
-        output_shape: list[int] = None,
-        column_types: ColumnTypes = None,
-        static_lookup_size: int = 0,
-        last_activation: str = None,
-        **kwargs
-    ) -> None:
-        """Builds TFT from parameters.
+class TemporalFusionTransformerBase:
+    def __init__(self, hidden_layer_size: int, dropout_rate: float, num_heads: int):
+        """Creates instance of TFT model.
 
         Args:
-            raw_params: Parameters to define TFT
+            hidden_layer_size: Internal state size of TFT.
+            dropout_rate: Dropout discard rate.
+            num_heads: Number of heads for interpretable multi-head attention.
         """
-
-        self.name = self.__class__.__name__
-
-        self.input_shape = input_shape
-
-        if column_types:
-            self.output_dim = output_shape[-1]
-            if "num_encoder_steps" in kwargs:
-                self.num_encoder_steps = kwargs["num_encoder_steps"]
-            else:
-                self.num_encoder_steps = input_shape[0] - output_shape[0]  # nongenerator window approach
-            # ^ num_encoder_steps should be generally equal to seq_len since we use forking sequences training scheme
-            if "future_size" in kwargs:
-                self.future_size = kwargs["future_size"]
-            else:
-                self.future_size = self.input_shape[0] - self.num_encoder_steps
-
-            (input_obs_loc, static_input_loc, known_regular_input_idx, knowns, unknowns,) = column_types.get_input_loc()
-            self.input_obs_loc = input_obs_loc
-            self.static_input_loc = static_input_loc
-            self.known_regular_input_idx = known_regular_input_idx
-            self.knowns = knowns
-            self.unknowns = unknowns
-        else:
-            # parameters for both get model variants:
-            self.output_dim = kwargs["output_dim"]
-            self.input_obs_loc = kwargs["input_obs_loc"]
-            self.static_input_loc = kwargs["static_input_loc"]
-            self.known_regular_input_idx = kwargs["known_regular_inputs"]
-            self.num_encoder_steps = kwargs["num_encoder_steps"]
-
-        self.static_lookup_size = static_lookup_size
-        # Network params
         self.hidden_layer_size = hidden_layer_size
         self.dropout_rate = dropout_rate
-
         self.num_heads = num_heads
 
-        self.last_activation = last_activation
-
-        # Extra components to store Tensorflow nodes for attention computations
-        self._attention_components = None
-
-    def get_future_fork_size(self):
-        """Returns the length of future "fork" the model does expect."""
-        return self.future_size
-
-    def get_tft_embeddings(self, all_inputs):
-        """Transforms raw inputs to embeddings.
-
-        Applies linear transformation onto continuous variables.
-
-        Args:
-            all_inputs: Inputs to transform
-
-        Returns:
-            Tensors for transformed inputs.
-        """
-
-        # Sanity checks
-        for i in self.known_regular_input_idx:
-            if i in self.input_obs_loc:
-                raise ValueError("Observation cannot be known a priori!")
-        for i in self.input_obs_loc:
-            if i in self.static_input_loc:
-                raise ValueError("Observation cannot be static!")
-
-        # Static inputs
-        if self.static_input_loc:
-            static_inputs = [
-                tf.keras.layers.Dense(self.hidden_layer_size)(all_inputs[:, 0, i : i + 1])
-                for i in range(self.input_shape[-1])
-                if i in self.static_input_loc
-            ]
-            static_inputs = Lambda(tf_stack, arguments={"axis": 1})(static_inputs)
-
-        else:
-            static_inputs = None
-
-        def convert_real_to_embedding(x):
-            """Applies linear transformation for time-varying inputs."""
-            return tf.keras.layers.TimeDistributed(tf.keras.layers.Dense(self.hidden_layer_size))(x)
-
-        # Targets
-        obs_inputs = Lambda(tf_stack, arguments={"axis": -1})(
-            [convert_real_to_embedding(all_inputs[..., i : i + 1]) for i in self.input_obs_loc]
-        )
-
-        unknown_inputs = []
-        for i in range(all_inputs.shape[-1]):
-            if i not in self.known_regular_input_idx and i not in self.input_obs_loc:
-                e = convert_real_to_embedding(all_inputs[..., i : i + 1])
-                unknown_inputs.append(e)
-
-        if unknown_inputs:
-            unknown_inputs = Lambda(tf_stack, arguments={"axis": -1})(unknown_inputs)
-        else:
-            unknown_inputs = None
-
-        # A priori known inputs
-        known_regular_inputs = [
-            convert_real_to_embedding(all_inputs[..., i : i + 1])
-            for i in self.known_regular_input_idx
-            if i not in self.static_input_loc
-        ]
-
-        known_combined_layer = Lambda(tf_stack, arguments={"axis": -1})(known_regular_inputs)
-
-        return unknown_inputs, known_combined_layer, obs_inputs, static_inputs
-
-    def get_inputs_orig(self, all_inputs):
-        """Get inputs for graph - original inputs isolation based on `encoder_steps`."""
-        # Size definitions.
-        encoder_steps = self.num_encoder_steps
-
-        (unknown_inputs, known_combined_layer, obs_inputs, static_inputs,) = self.get_tft_embeddings(all_inputs)
-
-        # Isolate known and observed historical inputs.
-        if unknown_inputs is not None:
-            historical_inputs = tf.keras.layers.Concatenate(axis=-1)(
-                [
-                    unknown_inputs[:, :encoder_steps, :],
-                    known_combined_layer[:, :encoder_steps, :],
-                    obs_inputs[:, :encoder_steps, :],
-                ],
-            )
-        else:
-            historical_inputs = tf.keras.layers.Concatenate(axis=-1)(
-                [known_combined_layer[:, :encoder_steps, :], obs_inputs[:, :encoder_steps, :]]
-            )
-
-        # Isolate only known future inputs.
-        future_inputs = known_combined_layer[:, encoder_steps:, :]
-
-        return historical_inputs, future_inputs, static_inputs
-
-    def get_inputs_from_windows(self, all_inputs):
-        """Get inputs for graph - inputs isolation based on `encoder_steps` for windowed approach with alignment.
-
-        Since TFT uses forking sequences, it needs to mask the times of the input to use only past known data
-        (:encoder_steps) and future known data (encoder_steps:)
-        """
-        # Size definitions.
-        encoder_steps = self.num_encoder_steps
-
-        (unknown_inputs, known_combined_layer, obs_inputs, static_inputs,) = self.get_tft_embeddings(all_inputs)
-
-        # Isolate known and observed historical inputs.
-        knowns = [unknown_inputs, known_combined_layer, obs_inputs]
-        knowns_times = [inp[:, :encoder_steps, :] for inp in knowns if inp is not None]
-        historical_inputs = tf.keras.layers.Concatenate(axis=-1)(knowns_times)
-
-        # Isolate only known future inputs.
-        future_inputs = known_combined_layer[:, encoder_steps:, :]
-
-        return historical_inputs, future_inputs, static_inputs
-
     def build_base_tft_graph(
-        self, historical_inputs, future_inputs, static_inputs, batch_dimensions=1
+        self, historical_inputs, future_inputs, static_inputs, n_batch_dimensions=1
     ) -> Tuple[Layer, Dict]:
         """Returns graph defining layers of the TFT.
 
         Args:
-            :batch_dimensions
-            Set to 2 to try experimental feature of the model to operate on 'more batch dimensions' more naturally.
-            So far the only thing that is preventing the model from being completely oblivious to the number
-            of batch dimensions is the lstm layer, that seems to need a specific number of dimensions.
+            historical_inputs: Concatenated past inputs to tft graph
+            future_inputs: Concatenated future inputs to tft graph
+            static_inputs: Static inputs to tft graph
+            n_batch_dimensions: Set to 2 to try experimental feature of the model to operate on 'more batch dimensions'
+             more naturally.
+             So far the only thing that is preventing the model from being completely oblivious to the number
+             of batch dimensions is the lstm layer, that seems to need a specific number of dimensions.
         """
 
         def static_combine_and_mask(embedding):
@@ -532,16 +377,16 @@ class TemporalFusionTransformer:
             static_encoder, static_weights = static_combine_and_mask(static_inputs)
 
             static_context_variable_selection = gated_residual_network(
-                static_encoder, self.hidden_layer_size, dropout_rate=self.dropout_rate, use_time_distributed=False,
+                static_encoder, self.hidden_layer_size, dropout_rate=self.dropout_rate, use_time_distributed=False
             )
             static_context_enrichment = gated_residual_network(
-                static_encoder, self.hidden_layer_size, dropout_rate=self.dropout_rate, use_time_distributed=False,
+                static_encoder, self.hidden_layer_size, dropout_rate=self.dropout_rate, use_time_distributed=False
             )
             static_context_state_h = gated_residual_network(
-                static_encoder, self.hidden_layer_size, dropout_rate=self.dropout_rate, use_time_distributed=False,
+                static_encoder, self.hidden_layer_size, dropout_rate=self.dropout_rate, use_time_distributed=False
             )
             static_context_state_c = gated_residual_network(
-                static_encoder, self.hidden_layer_size, dropout_rate=self.dropout_rate, use_time_distributed=False,
+                static_encoder, self.hidden_layer_size, dropout_rate=self.dropout_rate, use_time_distributed=False
             )
 
         def lstm_combine_and_mask(embedding):
@@ -563,9 +408,13 @@ class TemporalFusionTransformer:
             flatten = tf.reshape(embedding, shape=new_shape)
 
             if static_inputs is not None:
-                expanded_static_context = Lambda(tf.expand_dims, arguments={"axis": 1})(
-                    static_context_variable_selection
-                )
+                # gated_residual_network needs the same dimensions for `flatten` and `expanded_static_context`
+                # to be broadcasted together to the same shape.
+                # And we expand at axis=1, since the first dimension is batch dimension and that needs to stay the same.
+                expanded = static_context_variable_selection
+                for _ in range(n_batch_dimensions):
+                    expanded = Lambda(tf.expand_dims, arguments={"axis": 1})(expanded)
+                expanded_static_context = expanded
             else:
                 expanded_static_context = None
 
@@ -625,20 +474,20 @@ class TemporalFusionTransformer:
         if static_inputs is not None:
             history_lstm, state_h, state_c = timedistributed_of_lstm_state(
                 get_lstm(return_state=True),
-                batch_dimensions,
+                n_batch_dimensions,
                 historical_features,
                 initial_state=[static_context_state_h, static_context_state_c],
             )
 
             future_lstm = timedistributed_over_more_batch_dimensions(
-                get_lstm(return_state=False), batch_dimensions, future_features, initial_state=[state_h, state_c],
+                get_lstm(return_state=False), n_batch_dimensions, future_features, initial_state=[state_h, state_c]
             )
         else:
             history_lstm = timedistributed_over_more_batch_dimensions(
-                get_lstm(return_state=False), batch_dimensions, historical_features
+                get_lstm(return_state=False), n_batch_dimensions, historical_features
             )
             future_lstm = timedistributed_over_more_batch_dimensions(
-                get_lstm(return_state=False), batch_dimensions, future_features
+                get_lstm(return_state=False), n_batch_dimensions, future_features
             )
 
         lstm_layer = tf.keras.layers.Concatenate(axis=-2)([history_lstm, future_lstm])
@@ -652,7 +501,13 @@ class TemporalFusionTransformer:
 
         # Static enrichment layers
         if static_inputs is not None:
-            expanded_static_context = Lambda(tf.expand_dims, arguments={"axis": -2})(static_context_enrichment)
+            # gated_residual_network needs the same dimensions for `flatten` and `expanded_static_context`
+            # to be broadcasted together to the same shape.
+            # And we expand at axis=1, since the first dimension is batch dimension and that needs to stay the same.
+            expanded = static_context_enrichment
+            for _ in range(n_batch_dimensions):
+                expanded = Lambda(tf.expand_dims, arguments={"axis": -2})(expanded)
+            expanded_static_context = expanded
         else:
             expanded_static_context = None
         enriched, _ = gated_residual_network(
@@ -674,14 +529,16 @@ class TemporalFusionTransformer:
             x, self_att = self_attn_layer(enriched, enriched, enriched, mask=mask)
             return x, self_att
 
-        x, self_att = timedistributed_over_more_batch_dimensions(do_attention, batch_dimensions, enriched)
+        # self attention needs to be unsqueezed too
+        # (since effectively the windowing makes the self attention be applied only over each window)
+        x, self_att = timedistributed_over_more_batch_dimensions(do_attention, n_batch_dimensions, enriched)
 
         x, _ = apply_gating_layer(x, self.hidden_layer_size, dropout_rate=self.dropout_rate, activation=None)
         x = add_and_norm([x, enriched])
 
         # Nonlinear processing on outputs
         decoder = gated_residual_network(
-            x, self.hidden_layer_size, dropout_rate=self.dropout_rate, use_time_distributed=True,
+            x, self.hidden_layer_size, dropout_rate=self.dropout_rate, use_time_distributed=True
         )
 
         # Final skip connection
@@ -702,6 +559,162 @@ class TemporalFusionTransformer:
 
         return transformer_layer, attention_components
 
+
+class TemporalFusionTransformerOriginal(TemporalFusionTransformerBase):
+    """Parts of TFT implementation, that are closer to the original."""
+
+    def __init__(
+        self,
+        hidden_layer_size: int,
+        dropout_rate: float,
+        num_heads: int,
+        input_shape: list[int],
+        static_lookup_size: int = 0,
+        last_activation: str = None,
+        **kwargs
+    ) -> None:
+        """Creates instance of TFT model.
+
+        Args:
+            hidden_layer_size: Internal state size of TFT.
+            dropout_rate: Dropout discard rate.
+            num_heads: Number of heads for interpretable multi-head attention.
+            input_shape: Total time steps (i.e. Width of Temporal fusion decoder N) x total number of inputs.
+            static_lookup_size: Feature dimension size for static inputs.
+            last_activation: The last activation function.
+        """
+        TemporalFusionTransformerBase.__init__(self, hidden_layer_size, dropout_rate, num_heads)
+
+        self.name = self.__class__.__name__
+
+        self.input_shape = input_shape
+
+        # parameters for both get model variants:
+        self.output_dim = kwargs["output_dim"]
+        self.input_obs_loc = kwargs["input_obs_loc"]
+        self.static_input_loc = kwargs["static_input_loc"]
+        self.known_regular_input_idx = kwargs["known_regular_inputs"]
+        self.num_encoder_steps = kwargs["num_encoder_steps"]
+
+        self.static_lookup_size = static_lookup_size
+        # Network params
+
+        self.last_activation = last_activation
+
+        # Extra components to store Tensorflow nodes for attention computations
+        self._attention_components = None
+
+    def get_tft_embeddings(self, all_inputs):
+        """Transforms raw inputs to embeddings.
+
+        Applies linear transformation onto continuous variables.
+
+        Args:
+            all_inputs: Inputs to transform
+
+        Returns:
+            Tensors for transformed inputs.
+        """
+
+        # Sanity checks
+        for i in self.known_regular_input_idx:
+            if i in self.input_obs_loc:
+                raise ValueError("Observation cannot be known a priori!")
+        for i in self.input_obs_loc:
+            if i in self.static_input_loc:
+                raise ValueError("Observation cannot be static!")
+
+        # Static inputs
+        if self.static_input_loc:
+            static_inputs = [
+                tf.keras.layers.Dense(self.hidden_layer_size)(all_inputs[:, 0, i : i + 1])
+                for i in range(self.input_shape[-1])
+                if i in self.static_input_loc
+            ]
+            static_inputs = Lambda(tf_stack, arguments={"axis": 1})(static_inputs)
+
+        else:
+            static_inputs = None
+
+        def convert_real_to_embedding(x):
+            """Applies linear transformation for time-varying inputs."""
+            return tf.keras.layers.TimeDistributed(tf.keras.layers.Dense(self.hidden_layer_size))(x)
+
+        # Targets
+        obs_inputs = Lambda(tf_stack, arguments={"axis": -1})(
+            [convert_real_to_embedding(all_inputs[..., i : i + 1]) for i in self.input_obs_loc]
+        )
+
+        # TODO: Observed inputs
+        unknown_inputs = []
+        for i in range(all_inputs.shape[-1]):
+            if i not in self.known_regular_input_idx and i not in self.input_obs_loc:
+                e = convert_real_to_embedding(all_inputs[..., i : i + 1])
+                unknown_inputs.append(e)
+
+        if unknown_inputs:
+            unknown_inputs = Lambda(tf_stack, arguments={"axis": -1})(unknown_inputs)
+        else:
+            unknown_inputs = None
+
+        # A priori known inputs
+        known_regular_inputs = [
+            convert_real_to_embedding(all_inputs[..., i : i + 1])
+            for i in self.known_regular_input_idx
+            if i not in self.static_input_loc
+        ]
+
+        known_combined_layer = Lambda(tf_stack, arguments={"axis": -1})(known_regular_inputs)
+
+        return unknown_inputs, known_combined_layer, obs_inputs, static_inputs
+
+    def get_inputs_orig(self, all_inputs):
+        """Get inputs for graph - original inputs isolation based on `encoder_steps`."""
+        # Size definitions.
+        encoder_steps = self.num_encoder_steps
+
+        unknown_inputs, known_combined_layer, obs_inputs, static_inputs = self.get_tft_embeddings(all_inputs)
+
+        # Isolate known and observed historical inputs.
+        if unknown_inputs is not None:
+            historical_inputs = tf.keras.layers.Concatenate(axis=-1)(
+                [
+                    unknown_inputs[:, :encoder_steps, :],
+                    known_combined_layer[:, :encoder_steps, :],
+                    obs_inputs[:, :encoder_steps, :],
+                ],
+            )
+        else:
+            historical_inputs = tf.keras.layers.Concatenate(axis=-1)(
+                [known_combined_layer[:, :encoder_steps, :], obs_inputs[:, :encoder_steps, :]]
+            )
+
+        # Isolate only known future inputs.
+        future_inputs = known_combined_layer[:, encoder_steps:, :]
+
+        return historical_inputs, future_inputs, static_inputs
+
+    def get_inputs_from_windows(self, all_inputs):
+        """Get inputs for graph - inputs isolation based on `encoder_steps` for windowed approach with alignment.
+
+        Since TFT uses forking sequences, it needs to mask the times of the input to use only past known data
+        (:encoder_steps) and future known data (encoder_steps:)
+        """
+        # Size definitions.
+        encoder_steps = self.num_encoder_steps
+
+        unknown_inputs, known_combined_layer, obs_inputs, static_inputs = self.get_tft_embeddings(all_inputs)
+
+        # Isolate known and observed historical inputs.
+        knowns = [unknown_inputs, known_combined_layer, obs_inputs]
+        knowns_times = [inp[:, :encoder_steps, :] for inp in knowns if inp is not None]
+        historical_inputs = tf.keras.layers.Concatenate(axis=-1)(knowns_times)
+
+        # Isolate only known future inputs.
+        future_inputs = known_combined_layer[:, encoder_steps:, :]
+
+        return historical_inputs, future_inputs, static_inputs
+
     def get_model(self) -> tf.keras.Model:
         all_inputs = tf.keras.Input(shape=self.input_shape, name="input")
 
@@ -714,62 +727,144 @@ class TemporalFusionTransformer:
             historical_inputs, future_inputs, static_inputs
         )
 
+        # self.output_dim has quantiles already accounted for (if they are used in the loss)
+        # They are passed by:
+        # suggest_params <- get_batchpadded_shapes <- "output" gets shape of [batch, horizons, quantiles * cols names]
         outputs = tf.keras.layers.TimeDistributed(
-            tf.keras.layers.Dense(self.output_dim, activation=self.last_activation), name="output",
+            tf.keras.layers.Dense(self.output_dim, activation=self.last_activation), name="output"
         )(transformer_layer[..., self.num_encoder_steps :, :])
 
         self._attention_components = attention_components
 
         return tf.keras.models.Model(inputs=all_inputs, outputs=outputs)
 
+
+class TemporalFusionTransformer(TemporalFusionTransformerBase):
+    """Defines Temporal Fusion Transformer with tweaks for named inputs and vectorization."""
+
+    def __init__(
+        self,
+        hidden_layer_size: int,
+        dropout_rate: float,
+        num_heads: int,
+        input_shape: list[int],
+        n_observed: int,
+        n_known: int,
+        output_shape: list[int] = None,
+        static_lookup_size: int = 0,
+        last_activation: str = None,
+        **kwargs
+    ) -> None:
+        """Creates instance of TFT model.
+
+        Args:
+            hidden_layer_size: Internal state size of TFT.
+            dropout_rate: Dropout discard rate.
+            num_heads: Number of heads for interpretable multi-head attention.
+            input_shape: Total time steps (i.e. Width of Temporal fusion decoder N) x total number of inputs.
+            n_observed: Feature space dimension of observed variables
+            n_known: Feature space dimension of known variables
+            output_shape: Output shape.
+            static_lookup_size: Feature dimension size for static inputs.
+            last_activation: The last activation function.
+        """
+        TemporalFusionTransformerBase.__init__(self, hidden_layer_size, dropout_rate, num_heads)
+
+        self.name = self.__class__.__name__
+
+        self.input_shape = input_shape
+
+        self.output_dim = output_shape[-1]
+        if "num_encoder_steps" in kwargs:
+            self.num_encoder_steps = kwargs["num_encoder_steps"]
+        else:
+            self.num_encoder_steps = input_shape[0] - output_shape[0]  # nongenerator window approach
+        # ^ num_encoder_steps should be generally equal to history_size since we use forking sequences training scheme
+        if "future_size" in kwargs:
+            self.future_size = kwargs["future_size"]
+        else:
+            self.future_size = self.input_shape[0] - self.num_encoder_steps
+
+        self.n_observed = n_observed
+        self.n_known = n_known
+        self.static_lookup_size = static_lookup_size
+
+        # Network params
+        self.last_activation = last_activation
+
+        # Extra components to store Tensorflow nodes for attention computations
+        self._attention_components = None
+
+    @staticmethod
+    def assert_inputs_lengths_match(
+        fork_future_slice: slice,
+        history_size: int,
+        knowns: np.ndarray,
+        obs: np.ndarray,
+        data_y: Optional[np.ndarray],
+        index: Optional[np.ndarray],
+    ) -> bool:
+        """Asserts that the lengths of the data comply with the parameters of the TFT model.
+
+        (For single sequence variant of vectorized version.)
+        """
+        assert len(knowns) == len(obs) + s_len(
+            fork_future_slice
+        ), "TFT needs to have the lengths of known and observed tied"
+
+        # now, since we sometimes do not wish to provide both data_y and its index, we will test just what we get:
+        y_len = [data_y, index]
+        y_len = [len(value) for value in y_len if value is not None]
+        if len(y_len) >= 1:  # at least one is provided
+            assert (
+                y_len[0] == len(obs) + 1 - history_size
+            ), "TFT needs to have tied the lengths of predictions and history size"
+        elif len(y_len) == 2:  # both are provided
+            assert y_len[0] == y_len[1]
+
+    def get_future_fork_size(self):
+        """Returns the length of future "fork" the model does expect.
+
+        Used a function to be able to refactor easily in the future.
+        """
+        return self.future_size
+
     def create_named_inputs(self, past_size, future_size, single_sequence=False, known_size=None):
         static_emb = None
         obs_emb = None
-        unknown_emb = None
         known_emb = None
         static = None
         observed = None
-        unknown = None
         known = None
         future = None
 
         n_static = self.static_lookup_size
-        if len(self.static_input_loc) > 0:
-            logger.warning(
-                "Static inputs present, but we are using named (packed) representation and static inputs"
-                " are not time-dependent."
-            )
-        n_observed = len(self.input_obs_loc)
-        n_unknown = len(self.unknowns)
-        n_known = len(self.knowns)
+        n_observed = self.n_observed
+        n_known = self.n_known
 
         if n_static > 0:
-            static = tf.keras.Input(shape=[n_static], name="static")
+            static = tf.keras.Input(shape=[n_static], name=TFTInputNames.STATIC_INPUT)
             static_inputs = [
                 tf.keras.layers.Dense(self.hidden_layer_size)(static[..., i : i + 1]) for i in range(n_static)
             ]
             static_emb = Lambda(tf_stack, arguments={"axis": 1})(static_inputs)
+            # TODO check really +1 in axis? everything else has -1
 
         def convert_real_to_embedding(x):
             """Applies linear transformation for time-varying inputs."""
             return tf.keras.layers.TimeDistributed(tf.keras.layers.Dense(self.hidden_layer_size))(x)
 
         if n_observed > 0:
-            observed = tf.keras.Input(shape=[past_size, n_observed], name="observed")
+            observed = tf.keras.Input(shape=[past_size, n_observed], name=TFTInputNames.OBSERVED_INPUT)
             obs_inputs = [convert_real_to_embedding(observed[..., i : i + 1]) for i in range(n_observed)]
             obs_emb = Lambda(tf_stack, arguments={"axis": -1})(obs_inputs)
-
-        if n_unknown > 0:
-            unknown = tf.keras.Input(shape=[past_size, n_unknown], name="unknown")
-            unknown_inputs = [convert_real_to_embedding(unknown[..., i : i + 1]) for i in range(n_unknown)]
-            unknown_emb = Lambda(tf_stack, arguments={"axis": -1})(unknown_inputs)
 
         if n_known > 0:
             if single_sequence:
                 known_size = known_size
             else:
                 known_size = past_size
-            known = tf.keras.Input(shape=[known_size, n_known], name="known")
+            known = tf.keras.Input(shape=[known_size, n_known], name=TFTInputNames.KNOWN_INPUT)
             known_inputs = [convert_real_to_embedding(known[..., i : i + 1]) for i in range(n_known)]
             known_emb = Lambda(tf_stack, arguments={"axis": -1})(known_inputs)
         else:
@@ -777,15 +872,14 @@ class TemporalFusionTransformer:
                 raise ValueError("Known inputs must be specified since they are used also as future inputs.")
 
         if single_sequence:
-            if unknown_emb is None and obs_emb is None and past_size is None:
+            if obs_emb is None and past_size is None:
                 raise ValueError("Not enough information to infer sequence sizes for TFT")
             if self.get_future_fork_size() is None:
                 raise ValueError("For single_sequence, get_future_fork_size() needs to be specified.")
 
-            seq_non_future = [item for item in [unknown_emb, obs_emb] if item is not None]
-            if seq_non_future:
+            if obs_emb is not None:
                 # if we have any non-known sequence, then we cut the knowns at the same size, making it into past-knowns
-                inferred_future_cut = get_shape_fixed_if_possible(seq_non_future[0])[-3]
+                inferred_future_cut = get_shape_fixed_if_possible(obs_emb)[-3]
             else:
                 inferred_future_cut = (
                     get_shape_fixed_if_possible(known_emb)[-3] - past_size - self.get_future_fork_size()
@@ -799,16 +893,16 @@ class TemporalFusionTransformer:
             # assert len in timesteps of known_emb = known_emb_past (or any other past sequence) + future_size
         else:
             # Isolate only known future inputs.
-            future = tf.keras.Input(shape=[future_size, n_known], name="future-known")
+            future = tf.keras.Input(shape=[future_size, n_known], name=TFTInputNames.FUTURE_KNOWN_INPUT)
             future_inputs = [convert_real_to_embedding(future[..., i : i + 1]) for i in range(n_known)]
             known_emb_future = Lambda(tf_stack, arguments={"axis": -1})(future_inputs)
             known_emb_past = known_emb
 
         # Isolate known and observed historical inputs.
-        knowns_times = [inp for inp in [unknown_emb, known_emb_past, obs_emb] if inp is not None]
+        knowns_times = [inp for inp in [known_emb_past, obs_emb] if inp is not None]
         historical_inputs = tf.keras.layers.Concatenate(axis=-1)(knowns_times)
 
-        all_inputs = [inp for inp in [unknown, known, observed, static, future] if inp is not None]
+        all_inputs = [inp for inp in [known, observed, static, future] if inp is not None]
 
         return historical_inputs, known_emb_future, static_emb, all_inputs
 
@@ -816,15 +910,18 @@ class TemporalFusionTransformer:
         """Creates TFT model with named inputs.
 
         The goal is to not force TFT to unpack parameters from (windowed) blobs, but send everything already separated.
+
+        # TODO: hidden_layer_size * n_*** is there to make the same dimensions as self.get_tft_embeddings, since
+            the naming is misleading (should be self.hidden_layer_size_multiplier or something)
         """
-        (historical_inputs, future_emb, static_emb, all_inputs,) = self.create_named_inputs(
+        historical_inputs, future_emb, static_emb, all_inputs = self.create_named_inputs(
             self.num_encoder_steps, self.get_future_fork_size()
         )
 
         transformer_layer, attention_components = self.build_base_tft_graph(historical_inputs, future_emb, static_emb)
 
         outputs = tf.keras.layers.TimeDistributed(
-            tf.keras.layers.Dense(self.output_dim, activation=self.last_activation), name="output",
+            tf.keras.layers.Dense(self.output_dim, activation=self.last_activation), name="output"
         )(transformer_layer[..., self.num_encoder_steps :, :])
 
         self._attention_components = attention_components
@@ -845,7 +942,7 @@ class TemporalFusionTransformer:
             2 timeseries: H 'historical', F 'future' (some features from historical can be in the future )
 
             H ############################## (F is longer, since future known inputs need to be .. known)
-            F -----############################## (- means, that this input will never be used and so is omitted)
+            F -----############################## (- means, that this input will never be used and so is ommited)
 
             windowed approach takes history len or embedding len from H and then the needed future inputs from F:
             H XXXXXXXXXX####################
@@ -879,7 +976,7 @@ class TemporalFusionTransformer:
             vectorize slice, roll (not supported atm.), matrix multiplication (too heavy?), gather (used)
             or ideas from https://www.tensorflow.org/probability/api_docs/python/tfp/math/fill_triangular
         """
-        (historical_inputs, future_emb, static_emb, all_inputs,) = self.create_named_inputs(
+        historical_inputs, future_emb, static_emb, all_inputs = self.create_named_inputs(
             None,
             None,
             single_sequence,
@@ -891,7 +988,7 @@ class TemporalFusionTransformer:
             historical_windowed = windowing_mechanism(
                 historical_inputs, batch_dims=1, window_len=self.num_encoder_steps
             )
-            # since the insides of the model are not easily used on 4 dim sequence with first two dimensions being batch
+            # since the insides of the model are not easily used on 4 dim sequence with first two dimesnions being batch
             # we need to squash the dimensions into the batch dimension:
 
             # now we must repeat the batch dimension for static inputs to match the new batch dimension of "squashed"
@@ -901,16 +998,16 @@ class TemporalFusionTransformer:
             future_windowed = windowing_mechanism(future_emb, batch_dims=1, window_len=self.get_future_fork_size())
 
             transformer_layer, attention_components = self.build_base_tft_graph(
-                historical_windowed, future_windowed, static_emb, batch_dimensions=2
+                historical_windowed, future_windowed, static_emb, n_batch_dimensions=2
             )
         else:
             # windowing described in the docstring ^
             historical_windowed = windowing_mechanism(
                 historical_inputs, batch_dims=1, window_len=self.num_encoder_steps
             )
-            # since the insides of the model are not easily used on 4 dim sequence with first two dimensions being batch
+            # since the insides of the model are not easily used on 4 dim sequence with first two dimesnions being batch
             # we need to squash the dimensions into the batch dimension:
-            (historical_windowed_squashed, historical_windowed_orig_size,) = squash_batch_dimensions(
+            historical_windowed_squashed, historical_windowed_orig_size = squash_batch_dimensions(
                 historical_windowed, batch_dims=2
             )
 
@@ -918,18 +1015,16 @@ class TemporalFusionTransformer:
             static_emb_repeated = repeat_multiply_batch_dimension(static_emb, tf.shape(historical_windowed)[1])
 
             future_windowed = windowing_mechanism(future_emb, batch_dims=1, window_len=self.get_future_fork_size())
-            (future_windowed_squashed, future_windowed_orig_size,) = squash_batch_dimensions(
-                future_windowed, batch_dims=2
-            )
+            future_windowed_squashed, future_windowed_orig_size = squash_batch_dimensions(future_windowed, batch_dims=2)
 
-            (transformer_layer_squashed, attention_components,) = self.build_base_tft_graph(
-                historical_windowed_squashed, future_windowed_squashed, static_emb_repeated,
+            transformer_layer_squashed, attention_components = self.build_base_tft_graph(
+                historical_windowed_squashed, future_windowed_squashed, static_emb_repeated
             )
             # back to 4D: (from 3D squashed to batch dimension)
             transformer_layer = unsquash_batch_dimensions(transformer_layer_squashed, historical_windowed_orig_size)
 
         outputs = tf.keras.layers.TimeDistributed(
-            tf.keras.layers.Dense(self.output_dim, activation=self.last_activation), name="output",
+            tf.keras.layers.Dense(self.output_dim, activation=self.last_activation), name="output"
         )(transformer_layer[..., self.num_encoder_steps :, :])
 
         self._attention_components = attention_components

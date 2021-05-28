@@ -1,10 +1,29 @@
+from __future__ import annotations
+
+import abc
 import enum
+from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import List, Union
+from typing import List, Union, Callable
 
 import numpy as np
 import tensorflow as tf
+from keras.engine.keras_tensor import KerasTensor
 
+
+def s_len(xslice: slice) -> int:
+    """Get length of slice."""
+    return xslice.stop - xslice.start
+
+def flatten_deep(xlist: list):
+    """Recursively flattens (in depth first search manner) a structure containing lists and tuples."""
+    ret = []
+    for item in xlist:
+        if isinstance(item, list) or isinstance(item, tuple):
+            ret.extend(flatten_deep(item))
+        else:
+            ret.append(item)
+    return ret
 
 def expand_to_match_first_dims(indices, orig_seq, batch_dims):
     """Inserts batch_dims of orig_seq.shape[:batch_dims] dimensions to indices to make thise first dimensions match.
@@ -17,13 +36,15 @@ def expand_to_match_first_dims(indices, orig_seq, batch_dims):
     return tf.tile(indices, tile_match)
 
 
-def timedistributed_over_more_batch_dimensions(op, batch_dims, seq, **kwargs):
+def timedistributed_over_more_batch_dimensions(
+    op: Callable, batch_dims: int, seq: Union[KerasTensor, tf.Tensor], **kwargs
+):
     """A variant of Keras TimeDistributed wrapper layer to use more batch dimensions.
 
     Args:
-        op: Operation to be called with seq and kwargs
-        batch_dims: Number of batch dimensions to skip (vectorize over)
-        seq: Sequence or multidimensional data input
+        op: Operation to be called with seq and kwargs.
+        batch_dims: Number of batch dimensions to skip (vectorize over).
+        seq: Sequence or multidimensional data input.
 
     Returns:
         The result of the operation with the batch dimensions unchanged.
@@ -83,25 +104,16 @@ def squash_batch_dimensions(seq, batch_dims):
     """Squashes first (batch_dims) dimensions into 1 batch dimension."""
     batch_shape_orig = tf.shape(seq)[:batch_dims]
     retain_shape = tf.shape(seq)[batch_dims:]
-    new_shape = tf.concat([[-1], retain_shape], axis=-1)
-    seq_squashed = tf.reshape(seq, new_shape)  # tf.concat([[-1], retain_shape], axis=-1)
+    # new_shape = tf.concat([[-1], retain_shape], axis=-1)
+    # in tf 2.4 - the above should work with -1 but is not. (Report error to tensorflow?)
+    new_shape = tf.concat([[tf.math.reduce_prod(batch_shape_orig)], retain_shape], axis=-1)
+    seq_squashed = tf.reshape(seq, new_shape)
     return seq_squashed, batch_shape_orig
 
 
 def repeat_multiply_batch_dimension(static_variable, dim_multiply):
     """Multiplies batch dimension for a static variable to match other squashed input."""
     return tf.repeat(static_variable, dim_multiply, axis=0)
-
-
-def flatten_deep(xlist: list):
-    """Recursively flattens (in depth first search manner) a structure containing lists and tuples."""
-    ret = []
-    for item in xlist:
-        if isinstance(item, list) or isinstance(item, tuple):
-            ret.extend(flatten_deep(item))
-        else:
-            ret.append(item)
-    return ret
 
 
 def unsquash_batch_dimensions(seq: tf.Tensor, batch_shape_orig: Union[list, tf.Tensor]):
@@ -146,7 +158,7 @@ def windowing_mechanism(seq_data, batch_dims, window_len):
     result = tf.gather(seq_data, indices, batch_dims=batch_dims,)
     # now reshape it in the form of the matrix we want:
     new_shape = tf.concat(
-        [tf.shape(seq_data)[:batch_dims], [rep, window_len], tf.shape(seq_data)[batch_dims + 1 :]], axis=-1,
+        [tf.shape(seq_data)[:batch_dims], [rep, window_len], tf.shape(seq_data)[batch_dims + 1 :]], axis=-1
     )
     windowed = tf.reshape(result, new_shape)
     return windowed
@@ -161,93 +173,35 @@ def check_activation_len(layers, activations):
 
 
 class QuantileLoss(tf.keras.losses.Loss):
-    def __init__(self, quantiles: List = [0.1, 0.5, 0.9], output_size: int = 1):
-        self.quantiles = np.array(quantiles)
-        self.output_size = output_size  # in case we have multiple targets => output dim[-1] = output_size * n_quantiles
+    def __init__(self, quantiles: List = [0.1, 0.5, 0.9], targets_count: int = 1):
+        self.quantiles = quantiles
+        self.targets_count = (
+            targets_count  # in case we have multiple targets => output dim[-1] = output_size * n_quantiles
+        )
+        self._q_multipliers = np.array(self.quantiles * self.targets_count, dtype=float)
         super().__init__()
 
     def call(self, y_true, y_pred):
-        losses = []
-        for i, q in enumerate(self.quantiles):
-            error = tf.subtract(
-                y_true[..., self.output_size * i : self.output_size * (i + 1)],
-                y_pred[..., self.output_size * i : self.output_size * (i + 1)],
-            )
-            loss = tf.reduce_mean(tf.maximum(q * error, (q - 1) * error), axis=-1)
-            losses.append(loss)
+        """Computes the quantile loss from targets and sources in the tf graph.
 
-        combined_loss = tf.reduce_mean(tf.add_n(losses))
-        return combined_loss
-
-
-class InputTypes(enum.IntEnum):
-    KNOWN_INPUTS = 0
-    OBSERVED_INPUTS = 1
-    FORECAST_INPUTS = 2
-    TARGET = 3
-    TIME = 4
-    STATIC = 5
+        Assumes the same format as is introduced in `IndexedFeed.repeat_targets_for_quantiles`.
+        Example:
+            (two targets, three quantiles:)
+            t-p = error * self._q_multipliers
+            1 1           q1
+            1 1           q2
+            1 1           q3
+            2 2           q1
+            2 2           q2
+            2 2           q3
+        """
+        error = tf.subtract(y_true[..., :], y_pred[..., :])
+        same_type_q = tf.cast(tf.constant(self._q_multipliers, dtype=tf.float64), error.dtype)
+        return tf.reduce_mean(tf.maximum(same_type_q * error, (same_type_q - 1.0) * error))
 
 
-@dataclass
-class ColumnTypeInfo:
-    """
-    Attributes:
-        names: List of column names for the given column type.
-        loc: List of locations/indexes of these columns in regressor list.
-    """
-
-    names: List[str] = field(default_factory=lambda: [])
-    loc: List[int] = field(default_factory=lambda: [])
-
-
-@dataclass
-class ColumnTypes:
-    known_inputs: ColumnTypeInfo = ColumnTypeInfo()
-    observed_inputs: ColumnTypeInfo = ColumnTypeInfo()
-    forecast_inputs: ColumnTypeInfo = ColumnTypeInfo()
-    static_inputs: ColumnTypeInfo = ColumnTypeInfo()
-
-    def get_name_by_loc(self, loc):
-        for col_type in [
-            self.known_inputs,
-            self.observed_inputs,
-            self.forecast_inputs,
-            self.static_inputs,
-        ]:
-            if loc in col_type.loc:
-                return col_type.names[col_type.loc.index(loc)]
-        return None
-
-    def get_feature_space_size(self):
-        return (
-            len(self.forecast_inputs.loc)
-            + len(self.known_inputs.loc)
-            + len(self.observed_inputs.loc)
-            + len(self.static_inputs.loc)
-        )
-
-    def get_input_loc(self):
-        feature_space_len = self.get_feature_space_size()
-
-        input_obs_loc = self.observed_inputs.loc + self.forecast_inputs.loc
-        static_input_loc = self.static_inputs.loc
-        known_regular_input_idx = self.known_inputs.loc
-
-        for i in known_regular_input_idx:
-            if i in input_obs_loc:
-                raise ValueError("Observation cannot be known a priori!")
-        for i in input_obs_loc:
-            if i in static_input_loc:
-                raise ValueError("Observation cannot be static!")
-
-        knowns = [i for i in known_regular_input_idx if i not in static_input_loc]
-        unknowns = [i for i in range(feature_space_len) if i not in known_regular_input_idx and i not in input_obs_loc]
-
-        return (
-            input_obs_loc,
-            static_input_loc,
-            known_regular_input_idx,
-            knowns,
-            unknowns,
-        )
+class TFTInputNames(str, enum.Enum):
+    FUTURE_KNOWN_INPUT = "future-known"  # Only for non sequential TFT implementations
+    STATIC_INPUT = "static"
+    OBSERVED_INPUT = "observed"
+    KNOWN_INPUT = "known"

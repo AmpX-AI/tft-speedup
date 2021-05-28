@@ -9,7 +9,6 @@ import numpy as np
 import tensorflow as tf
 from matplotlib import pyplot as plt
 
-from tf_utils import ColumnTypeInfo, ColumnTypes
 from tft_model import TemporalFusionTransformer
 
 physical_devices = tf.config.list_physical_devices("GPU")
@@ -190,23 +189,11 @@ def simple_experiment(variant):
     def np_generator_steps(vectorized_input):
         return (total_data_len - model_seq_len + 1) * int(math.ceil(vectorized_input["known"].shape[0] / batch_size))
 
-    def input_types():
-        columns_ordering = ["observed", "known", "targets"]
-
-        def get_cti(name_list):
-            return ColumnTypeInfo(names=name_list, loc=[columns_ordering.index(name) for name in name_list],)
-
-        return ColumnTypes(
-            known_inputs=get_cti(["known"]),
-            observed_inputs=get_cti(["observed"]),
-            forecast_inputs=get_cti(["targets"]),
-            static_inputs=ColumnTypeInfo(),
-        )
-
     tft_model = TemporalFusionTransformer(
         input_shape=[model_seq_len, 2],
         output_shape=[model_future_horizons, 1],
-        column_types=input_types(),
+        n_known=1,  # see the generator
+        n_observed=2,  # see the generator
         future_size=model_future_horizons,
         num_encoder_steps=model_seq_len,
         dropout_rate=0.1,
